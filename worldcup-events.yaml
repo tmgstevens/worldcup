@@ -1,0 +1,107 @@
+# Redpanda Connect: FIFA World Cup live events -> Redpanda
+#
+# Runs as a managed Redpanda Connect pipeline (deploy with deploy.sh).
+#   topic:  worldcup.events
+#
+# Source: ESPN's free, no-key World Cup API (unofficial/undocumented).
+#   scoreboard         -> today's matches + live state
+#   summary?event={id} -> per-match keyEvents (kickoff, goals, cards, ...)
+# Polls every 2m; only fetches summaries for in-progress matches.
+# No API key required; the only secret is the Redpanda SASL password.
+#
+# Emitted event schema (per message, JSON, keyed by event_id):
+#   event_id, match ("Home vs Away"), short, kickoff, ke_id,
+#   kind (match_start|goal|yellow_card|red_card|penalty|match_end),
+#   type (raw ESPN type), minute, wallclock (ISO ts), team_id, text
+
+input:
+  generate:
+    interval: 2m
+    mapping: 'root = {}'
+
+pipeline:
+  processors:
+    # 1) Today's World Cup scoreboard.
+    - http:
+        url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard
+        verb: GET
+
+    # 2) One message per IN-PROGRESS match. ESPN names matches "Away at Home";
+    #    rewrite to "Home vs Away".
+    - mapping: |
+        root = this.events.or([]).filter(e -> e.status.type.state == "in").map_each(e -> {
+          "event_id": e.id,
+          "match":    if e.name.contains(" at ") { e.name.split(" at ").index(1) + " vs " + e.name.split(" at ").index(0) } else { e.name },
+          "short":    e.shortName,
+          "kickoff":  e.date,
+        })
+    - unarchive:
+        format: json_array
+
+    # 3) Attach each match's keyEvents timeline.
+    - branch:
+        request_map: 'root = this'
+        processors:
+          - http:
+              url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${! json("event_id") }
+              verb: GET
+        result_map: 'root.key_events = this.keyEvents'
+
+    # 4) Explode keyEvents, carrying match context. Note: variables are $-prefixed.
+    - mapping: |
+        let eid = this.event_id
+        let match = this.match
+        let short = this.short
+        let kickoff = this.kickoff
+        root = this.key_events.or([]).map_each(k -> {
+          "event_id":  $eid,
+          "match":     $match,
+          "short":     $short,
+          "kickoff":   $kickoff,
+          "ke_id":     k.id,
+          "type":      k.type.or({}).text,
+          "minute":    k.clock.or({}).displayValue,
+          "wallclock": k.wallclock,
+          "team_id":   k.team.or({}).id,
+          "text":      k.text,
+        })
+    - unarchive:
+        format: json_array
+
+    # 5) Map ESPN types -> canonical kinds; drop everything else.
+    #    ($t, NOT t -- a bare `t` resolves to this.t and errors on null.)
+    - mapping: |
+        let t = this.type.or("").lowercase()
+        let kind = if $t == "kickoff" { "match_start" }
+          else if $t.contains("penalty") && !$t.contains("goal") { "penalty" }
+          else if $t.contains("goal") { "goal" }
+          else if $t == "yellow card" { "yellow_card" }
+          else if $t == "red card" { "red_card" }
+          else if $t.contains("end regular time") || $t.contains("full time") || $t.contains("full-time") { "match_end" }
+          else { "" }
+        root = if $kind == "" { deleted() } else { this.merge({"kind": $kind}) }
+
+    # 6) Emit each real-world event once (stable ESPN event id).
+    - mapping: |
+        meta dedupe_key = this.event_id.string() + ":" + this.ke_id.string()
+    - dedupe:
+        cache: seen
+        key: ${! meta("dedupe_key") }
+
+cache_resources:
+  - label: seen
+    memory:
+      default_ttl: 24h
+
+output:
+  redpanda:
+    seed_brokers:
+      - seed-xxxx.your-cluster.cloud.redpanda.com:9092
+    topic: worldcup.events
+    key: ${! json("event_id") }
+    tls:
+      enabled: true
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: worldcup
+        password: ${secrets.REDPANDA_SASL_PASSWORD}

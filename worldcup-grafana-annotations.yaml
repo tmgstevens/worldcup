@@ -1,0 +1,51 @@
+# Redpanda Connect consumer: worldcup.events -> Grafana annotations
+#
+# Run:
+#   export REDPANDA_SASL_PASSWORD=...   # SASL user 'worldcup'
+#   export GRAFANA_TOKEN=...            # Grafana service-account token
+#   rpk connect run worldcup-grafana-annotations.yaml
+#
+# Creates org-level (tag-based) annotations. Any dashboard with an annotation
+# query filtered by tag "worldcup" will show them; filter/color by the per-event
+# tags (kind: goal/yellow_card/red_card/penalty/match_start/match_end).
+#
+# Set the output url below to your Grafana endpoint.
+
+input:
+  redpanda:
+    seed_brokers:
+      - seed-xxxx.your-cluster.cloud.redpanda.com:9092
+    topics: ["worldcup.events"]
+    consumer_group: grafana-annotations
+    start_from_oldest: true
+    tls:
+      enabled: true
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: worldcup
+        password: "${REDPANDA_SASL_PASSWORD}"
+
+pipeline:
+  processors:
+    # Build a Grafana annotation. Use the event's real wallclock as the time so
+    # backfilled/historical events land at the correct moment; fall back to now().
+    - mapping: |
+        let txt = this.text.or("")
+        let ts = if this.wallclock != null {
+          this.wallclock.ts_parse("2006-01-02T15:04:05Z07:00").ts_unix_milli()
+        } else {
+          now().ts_unix_milli()
+        }
+        root = {
+          "time": $ts,
+          "tags": [ "worldcup", this.kind, this.match ],
+          "text": if $txt != "" { $txt } else { this.kind + " - " + this.match },
+        }
+
+output:
+  http_client:
+    url: "http://localhost:3000/api/annotations"
+    verb: POST
+    headers:
+      Content-Type: application/json
+      Authorization: "Bearer ${GRAFANA_TOKEN}"

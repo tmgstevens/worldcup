@@ -1,0 +1,99 @@
+# Redpanda Connect consumer: worldcup.events -> Grafana annotations
+# Deployed as a Kubernetes workload; consumes from Redpanda over SASL and POSTs
+# annotations to the Grafana API.
+#
+#   kubectl apply -f k8s-worldcup-annotations.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: worldcup
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worldcup-secrets
+  namespace: worldcup
+type: Opaque
+stringData:
+  # Fill in locally before `kubectl apply`. DO NOT commit real values.
+  # (The live cluster already has these set from initial setup.)
+  REDPANDA_SASL_PASSWORD: "REPLACE_WITH_SASL_PASSWORD"
+  GRAFANA_TOKEN: "REPLACE_WITH_GRAFANA_TOKEN"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worldcup-annotations-config
+  namespace: worldcup
+data:
+  connect.yaml: |
+    input:
+      redpanda:
+        seed_brokers:
+          - seed-xxxx.your-cluster.cloud.redpanda.com:9092
+        topics: ["worldcup.events"]
+        consumer_group: grafana-annotations
+        start_from_oldest: true
+        tls:
+          enabled: true
+        sasl:
+          - mechanism: SCRAM-SHA-256
+            username: worldcup
+            password: "${REDPANDA_SASL_PASSWORD}"
+
+    pipeline:
+      processors:
+        - mapping: |
+            let txt = this.text.or("")
+            let ts = if this.wallclock != null {
+              this.wallclock.ts_parse("2006-01-02T15:04:05Z07:00").ts_unix_milli()
+            } else {
+              now().ts_unix_milli()
+            }
+            root = {
+              "time": $ts,
+              "tags": [ "worldcup", this.kind, this.match ],
+              "text": if $txt != "" { $txt } else { this.kind + " - " + this.match },
+            }
+
+    output:
+      http_client:
+        url: "http://your-grafana-host:3000/api/annotations"
+        verb: POST
+        headers:
+          Content-Type: application/json
+          Authorization: "Bearer ${GRAFANA_TOKEN}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worldcup-annotations
+  namespace: worldcup
+  labels: { app: worldcup-annotations }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: worldcup-annotations }
+  template:
+    metadata:
+      labels: { app: worldcup-annotations }
+    spec:
+      containers:
+        - name: connect
+          image: docker.redpanda.com/redpandadata/connect:latest
+          args: ["run", "/connect/connect.yaml"]
+          env:
+            - name: REDPANDA_SASL_PASSWORD
+              valueFrom: { secretKeyRef: { name: worldcup-secrets, key: REDPANDA_SASL_PASSWORD } }
+            - name: GRAFANA_TOKEN
+              valueFrom: { secretKeyRef: { name: worldcup-secrets, key: GRAFANA_TOKEN } }
+          volumeMounts:
+            - name: config
+              mountPath: /connect
+          resources:
+            requests: { cpu: "50m", memory: "96Mi" }
+            limits: { cpu: "250m", memory: "256Mi" }
+      volumes:
+        - name: config
+          configMap: { name: worldcup-annotations-config }

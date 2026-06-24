@@ -1,0 +1,11 @@
+# Never commit real credentials
+*.secret.yaml
+secret*.yaml
+.env
+.env.*
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Local tooling
+.DS_Store

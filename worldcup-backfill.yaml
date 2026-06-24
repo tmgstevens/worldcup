@@ -1,0 +1,83 @@
+# One-shot backfill: load a past day's finished World Cup matches into
+# worldcup.events. Same schema/mapping as worldcup-events.yaml, but:
+#   - input runs once (generate count: 1) then the pipeline stops
+#   - scoreboard is pinned to a date (?dates=YYYYMMDD)
+#   - filters to FINISHED matches (status state == "post")
+#   - no dedupe (each summary read once); adds "backfill": true marker
+#
+# Deployed as a managed pipeline, runs once, then sits STATE_STOPPED.
+# Change the date in the scoreboard URL to backfill a different day.
+
+input:
+  generate:
+    count: 1
+    interval: 1s
+    mapping: 'root = {}'
+
+pipeline:
+  processors:
+    - http:
+        url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=20260623
+        verb: GET
+
+    - mapping: |
+        root = this.events.or([]).filter(e -> e.status.type.state == "post").map_each(e -> {
+          "event_id": e.id,
+          "match":    if e.name.contains(" at ") { e.name.split(" at ").index(1) + " vs " + e.name.split(" at ").index(0) } else { e.name },
+          "short":    e.shortName,
+          "kickoff":  e.date,
+        })
+    - unarchive:
+        format: json_array
+
+    - branch:
+        request_map: 'root = this'
+        processors:
+          - http:
+              url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${! json("event_id") }
+              verb: GET
+        result_map: 'root.key_events = this.keyEvents'
+
+    - mapping: |
+        let eid = this.event_id
+        let match = this.match
+        let short = this.short
+        let kickoff = this.kickoff
+        root = this.key_events.or([]).map_each(k -> {
+          "event_id":  $eid,
+          "match":     $match,
+          "short":     $short,
+          "kickoff":   $kickoff,
+          "ke_id":     k.id,
+          "type":      k.type.or({}).text,
+          "minute":    k.clock.or({}).displayValue,
+          "wallclock": k.wallclock,
+          "team_id":   k.team.or({}).id,
+          "text":      k.text,
+        })
+    - unarchive:
+        format: json_array
+
+    - mapping: |
+        let t = this.type.or("").lowercase()
+        let kind = if $t == "kickoff" { "match_start" }
+          else if $t.contains("penalty") && !$t.contains("goal") { "penalty" }
+          else if $t.contains("goal") { "goal" }
+          else if $t == "yellow card" { "yellow_card" }
+          else if $t == "red card" { "red_card" }
+          else if $t.contains("end regular time") || $t.contains("full time") || $t.contains("full-time") { "match_end" }
+          else { "" }
+        root = if $kind == "" { deleted() } else { this.merge({"kind": $kind, "backfill": true}) }
+
+output:
+  redpanda:
+    seed_brokers:
+      - seed-xxxx.your-cluster.cloud.redpanda.com:9092
+    topic: worldcup.events
+    key: ${! json("event_id") }
+    tls:
+      enabled: true
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: worldcup
+        password: ${secrets.REDPANDA_SASL_PASSWORD}

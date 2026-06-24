@@ -1,0 +1,133 @@
+# One-shot backfill as a Kubernetes Job.
+# Fans out: dates -> scoreboard -> finished matches -> summaries -> keyEvents,
+# producing to worldcup.events (Redpanda Cloud). The in-cluster annotations
+# consumer turns them into Grafana annotations.
+#
+# Backfills 2026-06-11 .. 2026-06-22 (06-23 already done; skip to avoid dupes).
+#   kubectl apply -f k8s-worldcup-backfill-job.yaml
+#   kubectl logs -n worldcup job/worldcup-backfill -f
+#   kubectl delete -f k8s-worldcup-backfill-job.yaml   # cleanup
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worldcup-backfill-config
+  namespace: worldcup
+data:
+  connect.yaml: |
+    input:
+      generate:
+        count: 1
+        mapping: 'root = {}'
+
+    pipeline:
+      processors:
+        # 1) dates to backfill -> one message per date
+        - mapping: |
+            root = ["20260611","20260612","20260613","20260614","20260615","20260616",
+                    "20260617","20260618","20260619","20260620","20260621","20260622"]
+        - unarchive:
+            format: json_array
+        - mapping: 'root = {"date": this}'
+
+        # 2) each date's scoreboard
+        - branch:
+            request_map: 'root = this'
+            processors:
+              - http:
+                  url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=${! json("date") }
+                  verb: GET
+            result_map: 'root.events = this.events'
+
+        # 3) finished matches -> one message each
+        - mapping: |
+            root = this.events.or([]).filter(e -> e.status.type.state == "post").map_each(e -> {
+              "event_id": e.id,
+              "match":    if e.name.contains(" at ") { e.name.split(" at ").index(1) + " vs " + e.name.split(" at ").index(0) } else { e.name },
+              "short":    e.shortName,
+              "kickoff":  e.date,
+            })
+        - unarchive:
+            format: json_array
+
+        # 4) per-match keyEvents timeline
+        - branch:
+            request_map: 'root = this'
+            processors:
+              - http:
+                  url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${! json("event_id") }
+                  verb: GET
+            result_map: 'root.key_events = this.keyEvents'
+
+        # 5) explode keyEvents
+        - mapping: |
+            let eid = this.event_id
+            let match = this.match
+            let short = this.short
+            let kickoff = this.kickoff
+            root = this.key_events.or([]).map_each(k -> {
+              "event_id":  $eid,
+              "match":     $match,
+              "short":     $short,
+              "kickoff":   $kickoff,
+              "ke_id":     k.id,
+              "type":      k.type.or({}).text,
+              "minute":    k.clock.or({}).displayValue,
+              "wallclock": k.wallclock,
+              "team_id":   k.team.or({}).id,
+              "text":      k.text,
+            })
+        - unarchive:
+            format: json_array
+
+        # 6) canonical kind + filter ($t, not t)
+        - mapping: |
+            let t = this.type.or("").lowercase()
+            let kind = if $t == "kickoff" { "match_start" }
+              else if $t.contains("penalty") && !$t.contains("goal") { "penalty" }
+              else if $t.contains("goal") { "goal" }
+              else if $t == "yellow card" { "yellow_card" }
+              else if $t == "red card" { "red_card" }
+              else if $t.contains("end regular time") || $t.contains("full time") || $t.contains("full-time") { "match_end" }
+              else { "" }
+            root = if $kind == "" { deleted() } else { this.merge({"kind": $kind, "backfill": true}) }
+
+    output:
+      redpanda:
+        seed_brokers:
+          - seed-xxxx.your-cluster.cloud.redpanda.com:9092
+        topic: worldcup.events
+        key: ${! json("event_id") }
+        tls:
+          enabled: true
+        sasl:
+          - mechanism: SCRAM-SHA-256
+            username: worldcup
+            password: "${REDPANDA_SASL_PASSWORD}"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: worldcup-backfill
+  namespace: worldcup
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: connect
+          image: docker.redpanda.com/redpandadata/connect:latest
+          args: ["run", "/connect/connect.yaml"]
+          env:
+            - name: REDPANDA_SASL_PASSWORD
+              valueFrom: { secretKeyRef: { name: worldcup-secrets, key: REDPANDA_SASL_PASSWORD } }
+          volumeMounts:
+            - name: config
+              mountPath: /connect
+          resources:
+            requests: { cpu: "50m", memory: "96Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+      volumes:
+        - name: config
+          configMap: { name: worldcup-backfill-config }
