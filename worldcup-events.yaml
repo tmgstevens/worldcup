@@ -26,10 +26,13 @@ pipeline:
         url: https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard
         verb: GET
 
-    # 2) One message per IN-PROGRESS match. ESPN names matches "Away at Home";
-    #    rewrite to "Home vs Away".
+    # 2) One message per in-progress OR recently-finished match. "post" is
+    #    included so we still fetch the summary once the match ends -- ESPN only
+    #    adds the "End Regular Time" (match_end) keyEvent at full time, and flips
+    #    status "in" -> "post" at the same moment; dedup keeps everything else
+    #    single-emitted. ESPN names matches "Away at Home"; rewrite to "Home vs Away".
     - mapping: |
-        root = this.events.or([]).filter(e -> e.status.type.state == "in").map_each(e -> {
+        root = this.events.or([]).filter(e -> e.status.type.state == "in" || e.status.type.state == "post").map_each(e -> {
           "event_id": e.id,
           "match":    if e.name.contains(" at ") { e.name.split(" at ").index(1) + " vs " + e.name.split(" at ").index(0) } else { e.name },
           "short":    e.shortName,
