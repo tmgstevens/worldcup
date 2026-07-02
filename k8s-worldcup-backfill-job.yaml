@@ -84,11 +84,13 @@ data:
         - mapping: |
             let t = this.type.or("").lowercase()
             let kind = if $t == "kickoff" { "match_start" }
+              else if $t == "start extra time" { "extra_time_start" }
+              else if $t == "start shootout" { "shootout_start" }
               else if $t.contains("penalty") && !$t.contains("goal") { "penalty" }
               else if $t.contains("goal") { "goal" }
               else if $t == "yellow card" { "yellow_card" }
               else if $t == "red card" { "red_card" }
-              else if $t.contains("end regular time") || $t.contains("full time") || $t.contains("full-time") { "match_end" }
+              else if $t.contains("end regular time") || $t.contains("full time") || $t.contains("full-time") || $t.contains("end extra time") || $t == "end match" { "match_end" }
               else { "" }
             root = if $kind == "" { deleted() } else { this.merge({"kind": $kind, "backfill": true}) }
 
